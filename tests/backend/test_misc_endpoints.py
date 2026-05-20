@@ -1,7 +1,57 @@
 """
 Tests for miscellaneous API endpoints (demand, backlog, spending).
 """
+from datetime import datetime
 import pytest
+
+
+class TestCreateOrderEndpoint:
+    """Test suite for POST /api/orders (Restocking submission)."""
+
+    def test_create_order_success(self, client):
+        response = client.post(
+            "/api/orders",
+            json={
+                "items": [
+                    {"sku": "TMP-201", "name": "Temperature Sensor Module", "quantity": 50, "unit_price": 89.5}
+                ]
+            },
+        )
+        assert response.status_code == 200
+
+        order = response.json()
+        assert order["status"] == "Submitted"
+        assert order["customer"] == "Internal Restock"
+        assert order["order_number"].startswith("RST-")
+        assert order["total_value"] == 50 * 89.5
+        assert len(order["items"]) == 1
+        assert order["items"][0]["sku"] == "TMP-201"
+
+    def test_create_order_lead_time_within_range(self, client):
+        response = client.post(
+            "/api/orders",
+            json={"items": [{"sku": "X", "name": "Y", "quantity": 1, "unit_price": 1.0}]},
+        )
+        order = response.json()
+        order_date = datetime.fromisoformat(order["order_date"])
+        expected = datetime.fromisoformat(order["expected_delivery"])
+        delta_days = (expected - order_date).days
+        assert 7 <= delta_days <= 14
+
+    def test_create_order_appears_in_get_orders(self, client):
+        post_response = client.post(
+            "/api/orders",
+            json={"items": [{"sku": "Z", "name": "Zed", "quantity": 2, "unit_price": 10.0}]},
+        )
+        created_id = post_response.json()["id"]
+
+        list_response = client.get("/api/orders")
+        ids = [o["id"] for o in list_response.json()]
+        assert created_id in ids
+
+    def test_create_order_rejects_empty_items(self, client):
+        response = client.post("/api/orders", json={"items": []})
+        assert response.status_code == 400
 
 
 class TestDemandEndpoints:
