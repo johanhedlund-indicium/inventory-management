@@ -1,3 +1,5 @@
+import random
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
@@ -120,6 +122,33 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class CreateOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+
+class CreateOrderRequest(BaseModel):
+    items: List[CreateOrderItem]
+    customer: Optional[str] = "Internal Restock"
+
+class Task(BaseModel):
+    id: int
+    title: str
+    priority: str
+    dueDate: str
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str
+    dueDate: str
+
+# IDs 1-4 are reserved for the frontend mock tasks in useAuth.js, so API-created
+# tasks start at 1000 to avoid collisions when the two lists are merged in App.vue.
+tasks: List[dict] = []
+_next_task_id = 1000
+
 # API endpoints
 @app.get("/")
 def root():
@@ -160,6 +189,47 @@ def get_order(order_id: str):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+@app.post("/api/orders", response_model=Order)
+def create_order(request: CreateOrderRequest):
+    """Create a new order (used by the Restocking flow).
+
+    Submitted orders use status='Submitted' and a randomized 7-14 day
+    delivery window to mirror the synthetic data convention in
+    generate_data.py. Data is appended to the in-memory orders list and
+    does not persist across restarts.
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    now = datetime.now()
+    # Random 7-14 day lead time matches generate_data.py's delivery_days range
+    lead_time_days = random.randint(7, 14)
+    expected_delivery = now + timedelta(days=lead_time_days)
+
+    # RST- prefix distinguishes restock orders; numeric suffix is the running count
+    existing_submitted = [o for o in orders if o.get("status") == "Submitted"]
+    order_number = f"RST-{now.year}-{len(existing_submitted) + 1:04d}"
+
+    items_list = [item.model_dump() for item in request.items]
+    total_value = round(sum(i["quantity"] * i["unit_price"] for i in items_list), 2)
+
+    new_order = {
+        "id": f"submitted-{len(orders) + 1}",
+        "order_number": order_number,
+        "customer": request.customer or "Internal Restock",
+        "items": items_list,
+        "status": "Submitted",
+        "order_date": now.isoformat(timespec="seconds"),
+        "expected_delivery": expected_delivery.isoformat(timespec="seconds"),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": None,
+        "category": None,
+    }
+
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/demand", response_model=List[DemandForecast])
 def get_demand_forecasts():
@@ -303,6 +373,44 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    """Get all API-created tasks"""
+    return tasks
+
+@app.post("/api/tasks", response_model=Task)
+def create_task(request: CreateTaskRequest):
+    """Create a new task"""
+    global _next_task_id
+    new_task = {
+        "id": _next_task_id,
+        "title": request.title,
+        "priority": request.priority,
+        "dueDate": request.dueDate,
+        "status": "pending",
+    }
+    _next_task_id += 1
+    tasks.append(new_task)
+    return new_task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: int):
+    """Delete a task"""
+    index = next((i for i, t in enumerate(tasks) if t["id"] == task_id), None)
+    if index is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks.pop(index)
+    return {"success": True}
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: int):
+    """Toggle a task's status between pending and completed"""
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
 
 if __name__ == "__main__":
     import uvicorn
